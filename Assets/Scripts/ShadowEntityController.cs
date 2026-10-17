@@ -1,18 +1,9 @@
 using System.Collections;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace TheHouseIsAlive
 {
-    public enum EntityState
-    {
-        Dormant,
-        Hiding,
-        Scurrying,
-        Peeking,
-        Stalking,
-        Frozen
-    }
-
     /// <summary>
     /// Controls behavior and physical/occluded movements of the entity.
     /// Responds to observation states from DontLookAwayTracker.
@@ -33,13 +24,35 @@ namespace TheHouseIsAlive
 
         private DontLookAwayTracker _tracker;
         private Transform _playerTransform;
+        private NavMeshAgent _agent;
         private Coroutine _movementRoutine;
-        private Vector3 _currentDestination;
 
         public EntityState State => currentState;
 
+        private void Start()
+        {
+            if (GetComponentInChildren<MeshFilter>() == null)
+            {
+                GameObject creature = ProceduralCreatureMesh.CreateCreatureGameObject();
+                creature.transform.SetParent(transform, false);
+            }
+
+            if (entityMeshRenderer == null)
+            {
+                entityMeshRenderer = GetComponentInChildren<Renderer>();
+            }
+
+            _agent = GetComponent<NavMeshAgent>();
+        }
+
         public void Initialize(DontLookAwayTracker tracker, Transform playerTransform)
         {
+            if (_tracker != null)
+            {
+                _tracker.OnDirectGaze -= HandleGazeDirect;
+                _tracker.OnLookedAway -= HandleGazeLookedAway;
+            }
+
             _tracker = tracker;
             _playerTransform = playerTransform;
 
@@ -63,68 +76,94 @@ namespace TheHouseIsAlive
 
         private void Update()
         {
-            if (_tracker != null)
+            if (_tracker == null) return;
+
+            // Raw per-frame gaze (no debounce) so the freeze lands on the same frame.
+            _tracker.UpdateTargetVisibility(peekPivot != null ? peekPivot : transform);
+            bool observed = _tracker.IsDirectlyObserved;
+
+            EntityState next = CreatureBrain.Next(currentState, observed);
+            if (next != currentState)
             {
-                _tracker.UpdateTargetVisibility(transform);
+                if (next == EntityState.Frozen && _playerTransform != null)
+                {
+                    float dist = Vector3.Distance(transform.position, _playerTransform.position);
+                    if (dist < 2.5f)
+                    {
+                        try { OVRInput.SetControllerVibration(0.2f, 0.2f, OVRInput.Controller.All); } catch { }
+                    }
+                }
+
+                if (next == EntityState.Hiding && _movementRoutine != null)
+                {
+                    StopCoroutine(_movementRoutine);
+                    _movementRoutine = null;
+                }
+                SetState(next);
             }
 
-            if (currentState == EntityState.Stalking && _playerTransform != null)
+            if (currentState == EntityState.Stalking && _playerTransform != null
+                && CreatureBrain.CanMove(currentState, observed))
             {
-                // If player is looking directly at entity while stalking, immediately freeze
-                if (_tracker != null && _tracker.IsDirectlyObserved)
+                Vector3 destination = _playerTransform.position;
+                destination.y = transform.position.y;
+                if (Vector3.Distance(transform.position, destination) > minStalkDistance)
                 {
-                    SetState(EntityState.Frozen);
-                    return;
+                    MoveTowards(destination, creepSpeed);
                 }
-
-                // Advance towards player if unobserved
-                float distanceToPlayer = Vector3.Distance(transform.position, _playerTransform.position);
-                if (distanceToPlayer > minStalkDistance)
-                {
-                    Vector3 moveDir = (_playerTransform.position - transform.position).normalized;
-                    moveDir.y = 0; // Ground plane clamp
-                    transform.position += moveDir * (creepSpeed * Time.deltaTime);
-                    transform.rotation = Quaternion.LookRotation(moveDir);
-                }
+            }
+            else if (currentState == EntityState.Frozen && IsAgentOnNavMesh())
+            {
+                _agent.isStopped = true;
             }
         }
+
+        /// <summary>Begin the final stalk: the creature only advances while unobserved.</summary>
+        public void BeginStalk()
+        {
+            if (_movementRoutine != null) StopCoroutine(_movementRoutine);
+            _movementRoutine = null;
+            SetState(EntityState.Stalking);
+        }
+
+        public float DistanceTo(Vector3 point) => Vector3.Distance(transform.position, point);
 
         public void ScurryBetweenPoints(Vector3 startPoint, Vector3 endPoint, System.Action onComplete = null)
         {
-            transform.position = startPoint;
-            _currentDestination = endPoint;
-            SetState(EntityState.Scurrying);
-
             if (_movementRoutine != null) StopCoroutine(_movementRoutine);
-            _movementRoutine = StartCoroutine(ScurryRoutine(startPoint, endPoint, onComplete));
+            transform.position = startPoint;
+            SetState(EntityState.Scurrying);
+            _movementRoutine = StartCoroutine(ScurryRoutine(endPoint, onComplete));
         }
 
-        private IEnumerator ScurryRoutine(Vector3 start, Vector3 end, System.Action onComplete)
+        private IEnumerator ScurryRoutine(Vector3 end, System.Action onComplete)
         {
-            float journeyLength = Vector3.Distance(start, end);
-            float startTime = Time.time;
-
             while (Vector3.Distance(transform.position, end) > 0.05f)
             {
-                float distCovered = (Time.time - startTime) * scurrySpeed;
-                float fraction = Mathf.Clamp01(distCovered / journeyLength);
+                if (_tracker != null && _tracker.IsDirectlyObserved)
+                {
+                    SetState(EntityState.Hiding);
+                    _movementRoutine = null;
+                    yield break;
+                }
 
-                transform.position = Vector3.Lerp(start, end, fraction);
-                Vector3 dir = (end - start).normalized;
-                if (dir != Vector3.zero) transform.rotation = Quaternion.LookRotation(dir);
-
+                MoveTowards(end, scurrySpeed);
                 yield return null;
             }
 
-            transform.position = end;
+            MoveTo(end);
             SetState(EntityState.Hiding);
+            _movementRoutine = null;
             onComplete?.Invoke();
         }
 
         public void PeekFromAnchor(Vector3 anchorEdge, Vector3 viewVector)
         {
             transform.position = anchorEdge;
-            transform.rotation = Quaternion.LookRotation(viewVector);
+            if (viewVector.sqrMagnitude > 0.0001f)
+            {
+                transform.rotation = Quaternion.LookRotation(viewVector);
+            }
             SetState(EntityState.Peeking);
         }
 
@@ -136,7 +175,13 @@ namespace TheHouseIsAlive
             }
             else if (currentState == EntityState.Peeking)
             {
-                // Scurry back into hiding upon direct contact
+                if (_movementRoutine != null) StopCoroutine(_movementRoutine);
+                SetState(EntityState.Hiding);
+            }
+            else if (currentState == EntityState.Scurrying)
+            {
+                if (_movementRoutine != null) StopCoroutine(_movementRoutine);
+                _movementRoutine = null;
                 SetState(EntityState.Hiding);
             }
         }
@@ -145,20 +190,66 @@ namespace TheHouseIsAlive
         {
             if (currentState == EntityState.Frozen)
             {
-                // Resume stalk when look away occurs
                 SetState(EntityState.Stalking);
             }
+            else if (currentState == EntityState.Hiding)
+            {
+                SetState(EntityState.Peeking);
+            }
+            else if (currentState == EntityState.Peeking)
+            {
+                SetState(EntityState.Stalking);
+            }
+        }
+
+        private void MoveTowards(Vector3 destination, float speed)
+        {
+            if (IsAgentOnNavMesh())
+            {
+                _agent.isStopped = false;
+                _agent.speed = speed;
+                _agent.SetDestination(destination);
+                return;
+            }
+
+            Vector3 direction = destination - transform.position;
+            direction.y = 0f;
+            transform.position = Vector3.MoveTowards(transform.position, destination, speed * Time.deltaTime);
+            if (direction.sqrMagnitude > 0.0001f)
+            {
+                transform.rotation = Quaternion.LookRotation(direction);
+            }
+        }
+
+        private void MoveTo(Vector3 destination)
+        {
+            if (IsAgentOnNavMesh())
+            {
+                _agent.Warp(destination);
+                _agent.isStopped = true;
+            }
+            else
+            {
+                transform.position = destination;
+            }
+        }
+
+        private bool IsAgentOnNavMesh()
+        {
+            return _agent != null && _agent.isActiveAndEnabled && _agent.isOnNavMesh;
         }
 
         private void SetState(EntityState newState)
         {
             currentState = newState;
-            Debug.Log($"[ShadowEntity] State transition: {currentState}");
+            if (IsAgentOnNavMesh())
+            {
+                _agent.isStopped = newState == EntityState.Frozen || newState == EntityState.Hiding || newState == EntityState.Peeking;
+            }
 
             if (entityMeshRenderer != null)
             {
-                // Only hide mesh when completely dormant
-                entityMeshRenderer.enabled = (currentState != EntityState.Dormant);
+                entityMeshRenderer.enabled = currentState != EntityState.Dormant && currentState != EntityState.Hiding;
             }
         }
     }
