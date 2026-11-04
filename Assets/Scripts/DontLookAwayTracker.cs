@@ -82,16 +82,27 @@ namespace TheHouseIsAlive
 
         /// <summary>
         /// Ticks visibility check against a target transform.
+        /// Checks both root and upper body/eye elevation (1.1m) so looking at any
+        /// part of the creature triggers direct gaze recognition.
         /// </summary>
         public void UpdateTargetVisibility(Transform target)
         {
             if (target == null) return;
 
-            bool observed = CheckVisibility(target.position, out float dot, out float dist);
-            GazeDotProduct = dot;
+            Vector3 rootPos = target.position;
+            Vector3 eyePos = rootPos + Vector3.up * 1.1f;
+
+            bool observedRoot = CheckVisibility(rootPos, out float dotRoot, out float distRoot);
+            bool observedEye = CheckVisibility(eyePos, out float dotEye, out float distEye);
+
+            float bestDot = Mathf.Max(dotRoot, dotEye);
+            float dist = Mathf.Min(distRoot, distEye);
+            bool observed = observedRoot || observedEye;
+
+            GazeDotProduct = bestDot;
 
             float peripheralCos = Mathf.Cos(peripheralGazeAngle * 0.5f * Mathf.Deg2Rad);
-            IsInPeriphery = !observed && dot >= peripheralCos && dist <= maxDetectionDistance;
+            IsInPeriphery = !observed && bestDot >= peripheralCos && dist <= maxDetectionDistance;
             IsDirectlyObserved = observed;
 
             _timeSinceLastStateChange += Time.deltaTime;
