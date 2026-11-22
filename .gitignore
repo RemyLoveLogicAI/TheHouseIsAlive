@@ -1,0 +1,17 @@
+# Unity generated
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Bb]uilds/
+/[Bb]uild/
+*.csproj
+*.sln
+*.apk
+*.aab
+.DS_Store
+# Agent / editor plumbing
+.vscode/
+.idea/
+.utmp/
